@@ -1,5 +1,4 @@
-# AA-CLIP: Deep Analysis (Part 1/2)
-## Sections 1-5: Summary, Problem, Insight, Method, Architecture
+# AA-CLIP: Deep Analysis
 
 ---
 
