@@ -11,8 +11,8 @@
 -    **Mã môn học:** CS2230
 -    **Mã lớp:** CS2230.CH202
 -    **Năm học:** 2025 - 2026
--    **Giảng viên:** Lương Ngọc Hoàng
--    **Email Giảng viên:** hoangln@uit.edu.vn
+-    **Giảng viên:** Nguyễn Vinh Tiệp
+-    **Email Giảng viên:** tiepnv@uit.edu.vn
 
 ## Thông tin nhóm
 | STT | MSSV     | Họ và Tên         | GitHub                           | Email                  |
