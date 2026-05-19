@@ -46,7 +46,7 @@ AA-CLIP dùng full-rank adapter: W ∈ R^(1024×1024) = **~1M params/layer**. Lo
 
 ### 2.3. Tại sao dùng K-NN distance thay threshold cứng?
 
-Proposal trước đề xuất dùng "top-k% patches có anomaly score cao nhất" làm pseudo mask. Nhưng k% bao nhiêu? Threshold cố định không phù hợp cho mọi ảnh vì:
+Một cách tiếp cận đơn giản để tạo pseudo mask là chọn top-k% patches có anomaly score cao nhất. Tuy nhiên, k% bao nhiêu là hợp lý? Threshold cố định không phù hợp cho mọi ảnh vì:
 - Ảnh có anomaly lớn (30% diện tích) → cần threshold thấp
 - Ảnh có anomaly nhỏ (2% diện tích) → cần threshold cao
 - Ảnh normal (0% anomaly) → không nên tạo pseudo mask
@@ -141,13 +141,24 @@ Patches có margin nhỏ (gần boundary) → weight thấp → ít ảnh hưở
 
 ### 4.4. Thay đổi 3  Consistency Loss
 
-Bổ sung consistency loss để ổn định training khi dùng pseudo labels:
+Bổ sung consistency loss để ổn định training khi dùng pseudo labels. Có hai hình thức:
 
+**Multi-level consistency:** Anomaly maps từ các levels khác nhau (layer 6, 12, 18, 24) nên nhất quán — nếu vùng (x,y) là anomaly ở level sâu, nó cũng nên là anomaly ở level nông:
 ```
-L_consistency = MSE(anomaly_map_level_i, anomaly_map_level_j)
+L_multi_level = MSE(anomaly_map_level_i, anomaly_map_level_j)
 ```
 
-Anomaly maps từ các levels khác nhau (layer 6, 12, 18, 24) nên **nhất quán**  nếu vùng (x,y) là anomaly ở level sâu, nó cũng nên là anomaly ở level nông. Khi pseudo labels noisy, consistency loss giúp các levels "đồng thuận" và giảm noise.
+**Augmentation consistency:** Prediction map của ảnh gốc và ảnh sau augmentation nhẹ (flip, small crop, color jitter) nên tương đồng:
+```
+L_augment = MSE(anomaly_map(x), anomaly_map(aug(x)))
+```
+
+Tổng consistency loss:
+```
+L_consistency = L_multi_level + L_augment
+```
+
+Khi pseudo labels noisy, consistency loss giúp model không phụ thuộc vào từng pseudo label cụ thể mà học patterns ổn định hơn — các levels phải "đồng thuận" và augmentation không được thay đổi kết quả.
 
 ### 4.5. Tổng hợp Loss Function
 
@@ -229,6 +240,12 @@ Class name → Adapted Text Encoder → T_N, T_A
 - Chứng minh hiệu quả AA-CLIP đến từ **anomaly-aware text anchors** (core contribution), không phải chỉ từ pixel-level supervision.
 - Nếu kết quả khả quan → zero-shot AD không nhất thiết cần pixel masks → mở rộng khả năng ứng dụng.
 - LoRA adapter có thể là lựa chọn tốt hơn full-rank cho CLIP adaptation trong AD.
+
+### 5.4. Về ứng dụng
+
+Mô hình giảm phụ thuộc vào pixel masks có giá trị thực tiễn cao trong:
+- **Kiểm tra lỗi công nghiệp:** Trong dây chuyền sản xuất, việc gán nhãn vùng lỗi chi tiết trên ảnh sản phẩm (vết xước, lỗi hàn, nứt vỡ) rất tốn thời gian và cần kỹ thuật viên giàu kinh nghiệm. Mask-free cho phép triển khai nhanh chỉ với nhãn "lỗi/không lỗi".
+- **Y tế:** Annotation pixel-level trên ảnh CT/MRI cần bác sĩ chuyên khoa, chi phí rất cao và thời gian dài. Giảm dependency vào pixel masks giúp mở rộng ứng dụng AD sang các bệnh viện/phòng khám có ít nguồn lực annotation.
 
 ---
 
