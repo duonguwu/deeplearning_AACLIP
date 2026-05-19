@@ -102,42 +102,134 @@ x_enhanced = λ · x_residual + (1-λ) · x
 
 Với d=1024, r=8: giảm từ ~1M → ~16K params/layer. Vẫn giữ residual fusion (λ=0.1) để bảo vệ CLIP knowledge. LoRA đã được chứng minh hiệu quả trong fine-tuning LLMs và vision transformers, đặc biệt trong low-data và noisy-data settings.
 
-### 4.3. Thay đổi 2  Pseudo Mask bằng K-NN Distance
+### 4.3. Thay đổi 2 — Sinh Pseudo Mask thay Ground-Truth Mask
 
-Thay vì dùng GT segmentation mask trong loss, sinh pseudo mask từ chính AA-CLIP:
+Thay vì dùng GT segmentation mask trong loss, đề tài sinh **pseudo mask tự động** để làm supervision cho segmentation. Dưới đây là các phương pháp sinh pseudo mask được khảo sát, phân tích, và lựa chọn.
 
-**Bước 1:** Sau Stage 1 (text anchors đã disentangled), tính cosine similarity giữa mỗi visual patch và T_N, T_A:
+#### 4.3.1. Khảo sát các phương pháp sinh Pseudo Mask
+
+**Phương pháp A — Patch-Text Similarity Map**
+
+- **Định nghĩa:** Tính cosine similarity giữa visual patch features và text anchors (T_N, T_A) để xác định mức độ "bất thường" của từng vùng trong ảnh. Vùng có similarity cao với T_A (anomaly anchor) được coi là vùng bất thường.
+- **Input:** (1) Visual patch features V_patch từ visual encoder, (2) Text anchors T_N, T_A từ text encoder đã adapt.
+- **Output:** Anomaly heatmap kích thước N_patches (e.g., 37×37 cho input 518px), upscale lên H×W → pseudo mask nhị phân sau khi threshold.
+- **Cách thực hiện:**
+  ```
+  Với mỗi patch i:
+    sim_A(i) = CosSim(V_patch_i, T_A)     # Độ giống anomaly
+    sim_N(i) = CosSim(V_patch_i, T_N)     # Độ giống normal
+    margin(i) = sim_A(i) - sim_N(i)       # Dương = nghi anomaly
+  → Reshape margin thành grid 37×37
+  → Bilinear upscale lên H×W
+  → Threshold → pseudo mask {0, 1}
+  ```
+- **Ưu điểm:** Đơn giản, dùng components có sẵn trong AA-CLIP (T_N, T_A, V_patch), không cần thêm model hay training.
+- **Nhược điểm:** Độ phân giải thô (mỗi patch = 14×14 pixel), boundary giữa normal/anomaly không sắc nét.
+
+**Phương pháp B — GradCAM / Attention Map**
+
+- **Định nghĩa:** Sử dụng gradient hoặc attention weights từ visual encoder (ViT) để xác định vùng ảnh mà model "chú ý" nhất khi đưa ra dự đoán anomaly. GradCAM tính gradient của anomaly score theo feature maps, Attention Map lấy trực tiếp từ self-attention layers.
+- **Input:** (1) Ảnh đầu vào, (2) Visual encoder (ViT) đã forward, (3) Anomaly score (image-level).
+- **Output:** Heatmap H×W chỉ ra vùng model focus → threshold → pseudo mask.
+- **Cách thực hiện:**
+  ```
+  GradCAM:
+    1. Forward ảnh → anomaly score s
+    2. Backward: gradient = ∂s/∂F_last_layer
+    3. GradCAM = ReLU(Σ_c (gradient_c × F_c))     # weighted sum theo channel
+    4. Upscale → heatmap → threshold → pseudo mask
+
+  Attention Map:
+    1. Forward ảnh qua ViT
+    2. Lấy attention weights từ self-attention layer cuối: A ∈ R^(N×N)
+    3. Lấy attention từ [CLS] token tới các patch tokens: A_cls ∈ R^N
+    4. Reshape A_cls thành grid → upscale → heatmap → threshold → pseudo mask
+  ```
+- **Ưu điểm:** Không cần thêm model, giải thích được model đang nhìn vào đâu, có thể kết hợp với Phương pháp A để tăng tin cậy.
+- **Nhược điểm:** GradCAM trên ViT cho kết quả kém hơn trên CNN (do architecture khác). Attention map có thể diffuse (lan rộng), không localize chính xác.
+
+**Phương pháp C — Dùng Foundation Model (SAM)**
+
+- **Định nghĩa:** Sử dụng Segment Anything Model (SAM) — foundation model cho segmentation — để refine boundary của vùng anomaly. Similarity map thô (từ Phương pháp A) được dùng làm prompt points cho SAM, SAM trả về mask có boundary chính xác.
+- **Input:** (1) Ảnh gốc, (2) Rough anomaly region từ similarity map (dùng làm prompt cho SAM).
+- **Output:** Pseudo mask có boundary sắc nét, pixel-level accurate.
+- **Cách thực hiện:**
+  ```
+  1. Similarity map (Phương pháp A) → xác định vùng nghi anomaly
+  2. Chọn top-k points có anomaly score cao nhất → dùng làm point prompts
+  3. Feed ảnh + point prompts vào SAM
+  4. SAM output → mask với boundary chính xác
+  ```
+- **Ưu điểm:** Chất lượng mask cao nhất, boundary sắc nét, SAM là pretrained model miễn phí.
+- **Nhược điểm:** Thêm dependency ngoài (SAM model, ~600MB+), inference chậm hơn, khó phân biệt contribution của method mình vs SAM. Chỉ cần SAM lúc train, nhưng thêm complexity cho pipeline.
+
+**Phương pháp D — Iterative Self-Refinement**
+
+- **Định nghĩa:** Model tự sinh pseudo mask, train trên pseudo mask đó, rồi dùng model đã train để sinh pseudo mask tốt hơn, lặp lại nhiều rounds cho đến khi converge. Tương tự self-training trong semi-supervised learning.
+- **Input:** (1) Ảnh + image-level labels, (2) Model từ round trước (hoặc pretrained CLIP cho round 0).
+- **Output:** Pseudo mask cải thiện dần qua mỗi round.
+- **Cách thực hiện:**
+  ```
+  Round 0: Train model chỉ với image-level labels (BCE) → model thô
+  Round 1: Model thô sinh similarity map → pseudo mask v1
+           → Train lại model với pseudo mask v1 → model v1
+  Round 2: Model v1 sinh pseudo mask v2 (tốt hơn v1)
+           → Train lại → model v2
+  ...
+  Dừng khi: |performance(round_n) - performance(round_{n-1})| < ε
+  ```
+- **Ưu điểm:** Pseudo mask tự cải thiện, không cần model ngoài, tiềm năng đạt chất lượng cao.
+- **Nhược điểm:** Chậm (train nhiều lần), risk confirmation bias (model ngày càng confident vào lỗi sai của chính mình), không guarantee converge, implementation phức tạp.
+
+#### 4.3.2. So sánh và lựa chọn
+
+| Tiêu chí | A. Similarity Map | B. GradCAM/Attention | C. SAM | D. Iterative |
+|----------|-------------------|---------------------|--------|-------------|
+| Chất lượng mask | Trung bình | Trung bình | Cao | Cao dần |
+| Độ phức tạp | Thấp | Thấp | Cao | Rất cao |
+| Cần thêm model | Không | Không | Có (SAM) | Không |
+| Thời gian train | Bình thường | Bình thường | Bình thường | ×3-5 lần |
+| Dễ reproduce | Cao | Cao | Trung bình | Thấp |
+| Phù hợp project |  **Chọn chính** | Kết hợp bổ trợ | Không chọn | Không chọn |
+
+**Lựa chọn: Phương pháp A (Similarity Map)** làm phương pháp chính, với lý do:
+- Dùng components có sẵn (T_N, T_A, V_patch) → không thêm dependency
+- Đơn giản, dễ implement và reproduce
+- Kết hợp với adaptive threshold + confidence weighting đã giảm noise đáng kể
+- Phương pháp B (Attention Map) có thể được thử nghiệm bổ trợ trong ablation
+
+#### 4.3.3. Chi tiết phương pháp được chọn — Similarity Map + Adaptive Threshold
+
+**Bước 1 — Tính similarity margin:** Sau Stage 1 (text anchors đã disentangled), tính cosine similarity giữa mỗi visual patch và T_N, T_A:
 ```
 sim_N(i) = CosSim(V_patch_i, T_N)    # Similarity với normal
 sim_A(i) = CosSim(V_patch_i, T_A)    # Similarity với anomaly
 margin(i) = sim_A(i) - sim_N(i)      # Margin: dương = nghi anomaly
 ```
 
-**Bước 2:** Phân loại patches theo margin:
+**Bước 2 — Adaptive threshold:** Phân loại patches theo margin, threshold tự điều chỉnh theo phân phối margin từng ảnh:
 ```
+τ_high = mean(margin) + α · std(margin)    # Ngưỡng trên: rõ ràng anomaly
+τ_low  = mean(margin) - β · std(margin)    # Ngưỡng dưới: rõ ràng normal
+
 Nếu margin(i) > τ_high   → pseudo label = anomaly (tin cậy cao)
 Nếu margin(i) < τ_low    → pseudo label = normal (tin cậy cao)
-Nếu τ_low ≤ margin(i) ≤ τ_high → KHÔNG gán label (ambiguous, bỏ qua)
+Nếu τ_low ≤ margin(i) ≤ τ_high → KHÔNG gán label (ambiguous, bỏ qua trong loss)
 ```
+α, β là hyperparameters (mặc định α=1.0, β=0.5). Threshold thay đổi theo từng ảnh nên phù hợp cả anomaly lớn, nhỏ, và ảnh normal.
 
-Trong đó τ_high và τ_low được tính **adaptive theo từng ảnh** dựa trên phân phối margin:
-```
-τ_high = mean(margin) + α · std(margin)    # Vùng rõ ràng là anomaly
-τ_low  = mean(margin) - β · std(margin)    # Vùng rõ ràng là normal
-```
-α, β là hyperparameters (mặc định α=1.0, β=0.5).
-
-**Bước 3:** Confidence weighting  dùng |margin| làm trọng số:
+**Bước 3 — Confidence weighting:** Dùng |margin| làm trọng số cho từng patch:
 ```
 weight(i) = |margin(i)| / max(|margin|)    # Normalize về [0,1]
 ```
 Patches có margin lớn (xa decision boundary) → weight cao → đóng góp nhiều vào loss.
 Patches có margin nhỏ (gần boundary) → weight thấp → ít ảnh hưởng.
 
-**Ưu điểm so với threshold cứng:**
-- Adaptive: τ thay đổi theo ảnh, không cần tune global threshold
+**Ưu điểm của phương pháp được chọn:**
+- Adaptive: threshold thay đổi theo ảnh, không cần tune 1 global threshold cho tất cả
 - Robust: bỏ qua vùng ambiguous → tránh model học noise
-- Principled: dựa trên distance tới T_N/T_A đã có sẵn, không cần thêm network
+- Principled: dựa trên distance tới T_N/T_A có sẵn, không cần thêm network
+- Confidence weighting tự nhiên: margin càng rõ → càng tin cậy → weight càng cao
 
 ### 4.4. Thay đổi 3  Consistency Loss
 
