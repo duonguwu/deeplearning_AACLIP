@@ -133,11 +133,14 @@ def train_image_adapter(
     image_epoch: int,
     img_size: int,
     logger: logging.Logger,
+    accum_steps: int = 1,
 ):
+    scaler = torch.amp.GradScaler("cuda")
     for epoch in range(start_epoch, image_epoch):
         logger.info(f"training image epoch {epoch}:")
         loss_list = []
-        for input_data in tqdm(train_loader):
+        optimizer.zero_grad()
+        for step, input_data in enumerate(tqdm(train_loader)):
             image = input_data["image"].to(device)
             mask = input_data["mask"].to(device)
             label = input_data["label"].to(device)
@@ -148,21 +151,26 @@ def train_image_adapter(
                 [text_embeddings[class_name] for class_name in class_names], dim=0
             )
 
-            # forward image
-            patch_features, det_feature = model(image)
-            # calculate similarity and get prediction
-            loss = 0.0
-            det_feature = det_feature.unsqueeze(1)
-            cls_preds = torch.matmul(det_feature, epoch_text_feature)[:, 0]
-            loss += F.cross_entropy(cls_preds, label)
-            for f in patch_features:
-                # text-image alignment
-                patch_preds = calculate_similarity_map(f, epoch_text_feature, img_size)
-                loss += calculate_seg_loss(patch_preds, mask)  # backward
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            loss_list.append(loss.item())
+            with torch.amp.autocast("cuda"):
+                # forward image
+                patch_features, det_feature = model(image)
+                # calculate similarity and get prediction
+                loss = 0.0
+                det_feature = det_feature.unsqueeze(1)
+                cls_preds = torch.matmul(det_feature, epoch_text_feature)[:, 0]
+                loss += F.cross_entropy(cls_preds, label)
+                for f in patch_features:
+                    # text-image alignment
+                    patch_preds = calculate_similarity_map(f, epoch_text_feature, img_size)
+                    loss += calculate_seg_loss(patch_preds, mask)
+                loss = loss / accum_steps
+            # backward with AMP
+            scaler.scale(loss).backward()
+            if (step + 1) % accum_steps == 0 or (step + 1) == len(train_loader):
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+            loss_list.append(loss.item() * accum_steps)
             scheduler.step()
         logger.info(f"loss: {np.mean(loss_list)}")
         # save checkpoint
@@ -363,6 +371,7 @@ def main():
         save_path=args.save_path,
         img_size=args.img_size,
         logger=logger,
+        accum_steps=args.accum_steps,
     )
 
 
