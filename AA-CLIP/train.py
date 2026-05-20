@@ -49,56 +49,63 @@ def train_text_adapter(
     dataset_name: str,
     img_size: int,
     logger: logging.Logger,
+    accum_steps: int = 1,
 ):
+    scaler = torch.amp.GradScaler("cuda")
     for epoch in range(start_epoch, text_epoch):
         logger.info(f"training text epoch {epoch}:")
 
         loss_list = []
-        for input_data in tqdm(train_loader):
+        optimizer.zero_grad()
+        for step, input_data in enumerate(tqdm(train_loader)):
             image = input_data["image"].to(device)
             mask = input_data["mask"].to(device)
             class_names = input_data["class_name"]
 
-            # forward text
-            epoch_text_feature_dict = {}
-            for class_name in list(set(class_names)):
-                text_embedding = get_adapted_single_class_text_embedding(
-                    adapted_model, dataset_name, class_name, device
-                )
-                epoch_text_feature_dict[class_name] = text_embedding
-            epoch_text_feature = torch.stack(
-                [epoch_text_feature_dict[class_name] for class_name in class_names],
-                dim=0,
-            )  # bs,768,2
-            # forward image
-            with torch.no_grad():
-                _, patch_features = clip_surgery.encode_image(image, [6, 12, 18, 24])
-                cls_token, _ = adapted_model.clipmodel.encode_image(image, [])
-                cls_token = cls_token / cls_token.norm(dim=-1, keepdim=True)
-                patch_features = [
-                    clip_surgery.visual.ln_post(t[:, 1:, :]) for t in patch_features
-                ]
-                patch_features = [t @ clip_surgery.visual.proj for t in patch_features]
-                patch_features = [
-                    t / t.norm(dim=-1, keepdim=True) for t in patch_features
-                ]
-                patch_features = [t + cls_token.unsqueeze(1) for t in patch_features]
-            # calculate similarity and get prediction
-            for f in patch_features:
-                # bs,patch_num,768
-                patch_preds = calculate_similarity_map(f, epoch_text_feature, img_size)
-                loss = calculate_seg_loss(patch_preds, mask)
-                orthogonal_loss = (
-                    (epoch_text_feature[:, :, 0] * epoch_text_feature[:, :, 1])
-                    .sum(1)
-                    .mean()
-                ) ** 2
-                loss += orthogonal_loss * text_norm_weight
-            # backward
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            loss_list.append(loss.item())
+            # forward text (under AMP)
+            with torch.amp.autocast("cuda"):
+                epoch_text_feature_dict = {}
+                for class_name in list(set(class_names)):
+                    text_embedding = get_adapted_single_class_text_embedding(
+                        adapted_model, dataset_name, class_name, device
+                    )
+                    epoch_text_feature_dict[class_name] = text_embedding
+                epoch_text_feature = torch.stack(
+                    [epoch_text_feature_dict[class_name] for class_name in class_names],
+                    dim=0,
+                )  # bs,768,2
+                # forward image
+                with torch.no_grad():
+                    _, patch_features = clip_surgery.encode_image(image, [6, 12, 18, 24])
+                    cls_token, _ = adapted_model.clipmodel.encode_image(image, [])
+                    cls_token = cls_token / cls_token.norm(dim=-1, keepdim=True)
+                    patch_features = [
+                        clip_surgery.visual.ln_post(t[:, 1:, :]) for t in patch_features
+                    ]
+                    patch_features = [t @ clip_surgery.visual.proj for t in patch_features]
+                    patch_features = [
+                        t / t.norm(dim=-1, keepdim=True) for t in patch_features
+                    ]
+                    patch_features = [t + cls_token.unsqueeze(1) for t in patch_features]
+                # calculate similarity and get prediction
+                for f in patch_features:
+                    # bs,patch_num,768
+                    patch_preds = calculate_similarity_map(f, epoch_text_feature, img_size)
+                    loss = calculate_seg_loss(patch_preds, mask)
+                    orthogonal_loss = (
+                        (epoch_text_feature[:, :, 0] * epoch_text_feature[:, :, 1])
+                        .sum(1)
+                        .mean()
+                    ) ** 2
+                    loss += orthogonal_loss * text_norm_weight
+                loss = loss / accum_steps  # scale loss for gradient accumulation
+            # backward with AMP
+            scaler.scale(loss).backward()
+            if (step + 1) % accum_steps == 0 or (step + 1) == len(train_loader):
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+            loss_list.append(loss.item() * accum_steps)
             # scheduler.step()
         logger.info(f"loss: {np.mean(loss_list)}")
         # save checkpoint
@@ -213,6 +220,7 @@ def main():
     parser.add_argument("--image_adapt_weight", type=float, default=0.1)
     parser.add_argument("--text_adapt_until", type=int, default=3)
     parser.add_argument("--image_adapt_until", type=int, default=6)
+    parser.add_argument("--accum_steps", type=int, default=1, help="gradient accumulation steps (effective_batch = batch_size * accum_steps)")
 
     args = parser.parse_args()
     # ========================================================
@@ -332,6 +340,7 @@ def main():
             text_epoch=args.text_epoch,
             img_size=args.img_size,
             logger=logger,
+            accum_steps=args.accum_steps,
         )
     del text_dataloader, text_dataset, clip_surgery, text_optimizer
     torch.cuda.empty_cache()
