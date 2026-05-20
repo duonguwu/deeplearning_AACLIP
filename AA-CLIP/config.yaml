@@ -1,0 +1,17 @@
+paths:
+  # Cấu hình BASE_PATH (Kaggle thì đổi thành /kaggle/input)
+  base_path: "./data"
+  
+  # Cấu trúc thư mục con bên trong BASE_PATH cho từng dataset
+  datasets:
+    Brain: "MedAD/Brain_AD"
+    Liver: "MedAD/Liver_AD"
+    Retina: "MedAD/Retina_RESC_AD"
+    Colon_clinicDB: "Colon/CVC-ClinicDB"
+    Colon_colonDB: "Colon/CVC-ColonDB"
+    Colon_cvc300: "Colon/CVC-300"
+    Colon_Kvasir: "Colon/Kvasir"
+    BTAD: "BTech_Dataset_transformed"
+    MPDD: "MPDD"
+    MVTec: "mvtec_ad"
+    VisA: "VisA_20220922"
