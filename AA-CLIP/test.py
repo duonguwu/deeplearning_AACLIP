@@ -215,35 +215,75 @@ def main():
 
             # ========================================================
             # testing
-            with torch.no_grad():
-                class_text_embeddings = text_embeddings[class_name]
-                masks, labels, preds, preds_image, file_names = get_predictions(
-                    model=model,
-                    class_text_embeddings=class_text_embeddings,
-                    test_loader=image_dataloader,
-                    device=device,
-                    img_size=args.img_size,
-                    dataset=args.dataset,
+            try:
+                import psutil, traceback, sys
+                print(f"\n  [1/4] Inference for {class_name} ({len(image_dataset)} samples)...", flush=True)
+                sys.stdout.flush()
+                
+                with torch.no_grad():
+                    class_text_embeddings = text_embeddings[class_name]
+                    masks, labels, preds, preds_image, file_names = get_predictions(
+                        model=model,
+                        class_text_embeddings=class_text_embeddings,
+                        test_loader=image_dataloader,
+                        device=device,
+                        img_size=args.img_size,
+                        dataset=args.dataset,
+                    )
+                
+                # ========================================================
+                # Debug: array info
+                ram_gb = psutil.Process().memory_info().rss / 1e9
+                gpu_mb = torch.cuda.memory_allocated() / 1e6 if torch.cuda.is_available() else 0
+                arr_gb = (masks.nbytes + preds.nbytes + preds_image.nbytes + labels.nbytes) / 1e9
+                print(f"  [2/4] Inference done. Arrays: masks={masks.shape}({masks.dtype}) "
+                      f"preds={preds.shape}({preds.dtype})", flush=True)
+                print(f"        Array mem={arr_gb:.2f}GB | Process RAM={ram_gb:.2f}GB | "
+                      f"GPU={gpu_mb:.0f}MB", flush=True)
+                
+                # Check for NaN/Inf
+                nan_mask = np.isnan(preds).any() or np.isinf(preds).any()
+                nan_img = np.isnan(preds_image).any() or np.isinf(preds_image).any()
+                if nan_mask or nan_img:
+                    print(f"  ⚠️ WARNING: NaN/Inf detected! preds={nan_mask} preds_image={nan_img}", flush=True)
+                
+                # Check labels distribution
+                unique_labels = np.unique(labels)
+                print(f"        labels={unique_labels} (unique), mask_range=[{masks.min():.2f}, {masks.max():.2f}]", flush=True)
+                
+                logger.info("DEBUG: %s masks=%s preds=%s arr=%.2fGB RAM=%.2fGB GPU=%.0fMB labels=%s",
+                            class_name, masks.shape, preds.shape, arr_gb, ram_gb, gpu_mb, unique_labels)
+                sys.stdout.flush()
+                
+                # ========================================================
+                if args.visualize:
+                    visualize(
+                        masks, preds, file_names,
+                        args.save_path, args.dataset, class_name=class_name,
+                    )
+                
+                print(f"  [3/4] Computing metrics for {class_name}...", flush=True)
+                sys.stdout.flush()
+                
+                class_result_dict = metrics_eval(
+                    masks, labels, preds, preds_image,
+                    class_name, domain=DOMAINS[args.dataset],
                 )
-            # ========================================================
-            if args.visualize:
-                visualize(
-                    masks,
-                    preds,
-                    file_names,
-                    args.save_path,
-                    args.dataset,
-                    class_name=class_name,
-                )
-            class_result_dict = metrics_eval(
-                masks,
-                labels,
-                preds,
-                preds_image,
-                class_name,
-                domain=DOMAINS[args.dataset],
-            )
-            df.loc[len(df)] = Series(class_result_dict)
+                
+                print(f"  [4/4] ✅ Done: {class_result_dict}", flush=True)
+                df.loc[len(df)] = Series(class_result_dict)
+                
+                # Free memory
+                del masks, labels, preds, preds_image, file_names
+                import gc; gc.collect()
+                torch.cuda.empty_cache()
+                
+            except Exception as e:
+                print(f"\n  ❌ EXCEPTION for {class_name}: {type(e).__name__}: {e}", flush=True)
+                traceback.print_exc()
+                logger.error("EXCEPTION for %s: %s", class_name, traceback.format_exc())
+                continue
+            
         numeric_cols = ["pixel AUC", "pixel AP", "image AUC", "image AP"]
         avg_row = df[numeric_cols].mean()
         avg_row["class name"] = "Average"
