@@ -217,43 +217,69 @@ def main():
             # testing
             try:
                 import psutil, traceback, sys
-                print(f"\n  [1/4] Inference for {class_name} ({len(image_dataset)} samples)...", flush=True)
-                sys.stdout.flush()
                 
-                with torch.no_grad():
-                    class_text_embeddings = text_embeddings[class_name]
-                    masks, labels, preds, preds_image, file_names = get_predictions(
-                        model=model,
-                        class_text_embeddings=class_text_embeddings,
-                        test_loader=image_dataloader,
-                        device=device,
-                        img_size=args.img_size,
-                        dataset=args.dataset,
+                # Check for cached predictions
+                cache_dir = os.path.join(args.save_path, "pred_cache", args.dataset)
+                os.makedirs(cache_dir, exist_ok=True)
+                cache_file = os.path.join(cache_dir, f"{class_name}_epoch{test_epoch}.npz")
+                
+                if os.path.exists(cache_file):
+                    print(f"\n  [CACHE] Loading cached predictions for {class_name}...", flush=True)
+                    cached = np.load(cache_file)
+                    masks = cached["masks"]
+                    labels = cached["labels"]
+                    preds = cached["preds"]
+                    preds_image = cached["preds_image"]
+                    print(f"  [CACHE] Loaded! masks={masks.shape} preds={preds.shape}", flush=True)
+                else:
+                    print(f"\n  [1/4] Inference for {class_name} ({len(image_dataset)} samples)...", flush=True)
+                    sys.stdout.flush()
+                    
+                    with torch.no_grad():
+                        class_text_embeddings = text_embeddings[class_name]
+                        masks, labels, preds, preds_image, file_names = get_predictions(
+                            model=model,
+                            class_text_embeddings=class_text_embeddings,
+                            test_loader=image_dataloader,
+                            device=device,
+                            img_size=args.img_size,
+                            dataset=args.dataset,
+                        )
+                    
+                    # ========================================================
+                    # Debug: array info
+                    ram_gb = psutil.Process().memory_info().rss / 1e9
+                    gpu_mb = torch.cuda.memory_allocated() / 1e6 if torch.cuda.is_available() else 0
+                    arr_gb = (masks.nbytes + preds.nbytes + preds_image.nbytes + labels.nbytes) / 1e9
+                    print(f"  [2/4] Inference done. Arrays: masks={masks.shape}({masks.dtype}) "
+                          f"preds={preds.shape}({preds.dtype})", flush=True)
+                    print(f"        Array mem={arr_gb:.2f}GB | Process RAM={ram_gb:.2f}GB | "
+                          f"GPU={gpu_mb:.0f}MB", flush=True)
+                    
+                    # Check for NaN/Inf
+                    nan_mask = np.isnan(preds).any() or np.isinf(preds).any()
+                    nan_img = np.isnan(preds_image).any() or np.isinf(preds_image).any()
+                    if nan_mask or nan_img:
+                        print(f"  ⚠️ WARNING: NaN/Inf detected! preds={nan_mask} preds_image={nan_img}", flush=True)
+                    
+                    # Check labels distribution
+                    unique_labels = np.unique(labels)
+                    print(f"        labels={unique_labels} (unique), mask_range=[{masks.min():.2f}, {masks.max():.2f}]", flush=True)
+                    
+                    logger.info("DEBUG: %s masks=%s preds=%s arr=%.2fGB RAM=%.2fGB GPU=%.0fMB labels=%s",
+                                class_name, masks.shape, preds.shape, arr_gb, ram_gb, gpu_mb, unique_labels)
+                    sys.stdout.flush()
+                    
+                    # Save predictions cache (float16 to save disk)
+                    print(f"  [2.5/4] Saving predictions cache...", flush=True)
+                    np.savez_compressed(cache_file,
+                        masks=masks.astype(np.float16),
+                        labels=labels,
+                        preds=preds.astype(np.float16),
+                        preds_image=preds_image.astype(np.float16),
                     )
-                
-                # ========================================================
-                # Debug: array info
-                ram_gb = psutil.Process().memory_info().rss / 1e9
-                gpu_mb = torch.cuda.memory_allocated() / 1e6 if torch.cuda.is_available() else 0
-                arr_gb = (masks.nbytes + preds.nbytes + preds_image.nbytes + labels.nbytes) / 1e9
-                print(f"  [2/4] Inference done. Arrays: masks={masks.shape}({masks.dtype}) "
-                      f"preds={preds.shape}({preds.dtype})", flush=True)
-                print(f"        Array mem={arr_gb:.2f}GB | Process RAM={ram_gb:.2f}GB | "
-                      f"GPU={gpu_mb:.0f}MB", flush=True)
-                
-                # Check for NaN/Inf
-                nan_mask = np.isnan(preds).any() or np.isinf(preds).any()
-                nan_img = np.isnan(preds_image).any() or np.isinf(preds_image).any()
-                if nan_mask or nan_img:
-                    print(f"  ⚠️ WARNING: NaN/Inf detected! preds={nan_mask} preds_image={nan_img}", flush=True)
-                
-                # Check labels distribution
-                unique_labels = np.unique(labels)
-                print(f"        labels={unique_labels} (unique), mask_range=[{masks.min():.2f}, {masks.max():.2f}]", flush=True)
-                
-                logger.info("DEBUG: %s masks=%s preds=%s arr=%.2fGB RAM=%.2fGB GPU=%.0fMB labels=%s",
-                            class_name, masks.shape, preds.shape, arr_gb, ram_gb, gpu_mb, unique_labels)
-                sys.stdout.flush()
+                    cache_mb = os.path.getsize(cache_file) / 1e6
+                    print(f"          Saved: {cache_file} ({cache_mb:.0f}MB)", flush=True)
                 
                 # ========================================================
                 if args.visualize:

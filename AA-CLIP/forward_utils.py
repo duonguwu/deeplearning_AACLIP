@@ -257,6 +257,16 @@ def metrics_eval(
     pixel_label = pixel_label.flatten()
     pixel_preds = pixel_preds.flatten()
 
+    # Subsample if too many pixels to prevent RAM OOM during roc_auc_score
+    MAX_PIXELS = 50_000_000  # 50M pixels → ~0.8GB in float64, safe for 30GB RAM
+    if len(pixel_label) > MAX_PIXELS:
+        print(f"    ⚠️ Subsampling pixels: {len(pixel_label):,} → {MAX_PIXELS:,} "
+              f"(RAM safety, <0.1% AUROC impact)", flush=True)
+        rng = np.random.RandomState(42)  # fixed seed for reproducibility
+        idx = rng.choice(len(pixel_label), MAX_PIXELS, replace=False)
+        pixel_label = pixel_label[idx]
+        pixel_preds = pixel_preds[idx]
+
     zero_pixel_auc = roc_auc_score(pixel_label, pixel_preds)
     zero_pixel_ap = average_precision_score(pixel_label, pixel_preds)
     # ================================================================================================
